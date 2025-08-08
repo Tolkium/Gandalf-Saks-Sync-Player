@@ -53,6 +53,8 @@
 
 <script>
     const urlParams = new URLSearchParams(location.search);
+    const mode = (urlParams.get('mode') || 'yt').toLowerCase(); // 'yt' or 'native'
+    const nativeSrc = urlParams.get('src') || '';
     // Optional UTC anchor and period overrides for deterministic alignment across reloads
     let anchorMs = (() => {
         const t0 = urlParams.get('t0');
@@ -73,26 +75,49 @@
     // All clients compute the same position from a shared UTC clock.
     function nowMs() { return Date.now(); }
     let utcOffsetMs = 0; // world UTC ~= nowMs() + utcOffsetMs
-    async function refreshUtcOffset(sampleCount = 7) {
-        let best = null; // {offset, rtt}
-        for (let i = 0; i < sampleCount; i++) {
-            try {
-                const t0 = performance.now();
-                const res = await fetch('https://worldtimeapi.org/api/timezone/Etc/UTC', { cache: 'no-store' });
-                const t1 = performance.now();
-                if (!res.ok) continue;
-                const data = await res.json();
-                const serverUtcMs = (data.unixtime || Math.floor(Date.parse(data.utc_datetime) / 1000)) * 1000;
-                const rtt = t1 - t0;
-                const estimatedServerNow = serverUtcMs + rtt / 2;
-                const offset = estimatedServerNow - nowMs();
-                if (!best || rtt < best.rtt) best = { offset, rtt };
-            } catch {}
+    async function fetchUtcFromWorldtimeapi() {
+        const t0 = performance.now();
+        const res = await fetch('https://worldtimeapi.org/api/timezone/Etc/UTC', { cache: 'no-store' });
+        const t1 = performance.now();
+        if (!res.ok) throw new Error('wta not ok');
+        const data = await res.json();
+        const serverUtcMs = (data.unixtime || Math.floor(Date.parse(data.utc_datetime) / 1000)) * 1000;
+        const rtt = t1 - t0;
+        return { estimatedUtcMs: serverUtcMs + rtt / 2, rtt };
+    }
+    async function fetchUtcFromTimeapiIo() {
+        const t0 = performance.now();
+        const res = await fetch('https://www.timeapi.io/api/Time/current/zone?timeZone=UTC', { cache: 'no-store' });
+        const t1 = performance.now();
+        if (!res.ok) throw new Error('timeapi not ok');
+        const data = await res.json();
+        const serverUtcMs = Date.parse(data.dateTime + 'Z');
+        const rtt = t1 - t0;
+        return { estimatedUtcMs: serverUtcMs + rtt / 2, rtt };
+    }
+    async function fetchUtcFromSelfDateHeader() {
+        const t0 = performance.now();
+        const res = await fetch(location.href, { method: 'GET', cache: 'no-store' });
+        const t1 = performance.now();
+        const dateHeader = res.headers.get('Date');
+        if (!dateHeader) throw new Error('no date hdr');
+        const serverUtcMs = Date.parse(dateHeader);
+        const rtt = t1 - t0;
+        return { estimatedUtcMs: serverUtcMs + rtt / 2, rtt };
+    }
+    async function refreshUtcOffset(samplesPerSource = 2) {
+        const results = [];
+        for (let i = 0; i < samplesPerSource; i++) {
+            try { results.push(await fetchUtcFromWorldtimeapi()); } catch {}
+            try { results.push(await fetchUtcFromTimeapiIo()); } catch {}
+            try { results.push(await fetchUtcFromSelfDateHeader()); } catch {}
         }
-        if (best) {
-            // Smooth to avoid sudden jumps
-            utcOffsetMs = 0.8 * utcOffsetMs + 0.2 * best.offset;
-        }
+        if (results.length === 0) return;
+        results.sort((a, b) => a.rtt - b.rtt);
+        const best = results[0];
+        const newOffset = best.estimatedUtcMs - nowMs();
+        // Smooth to avoid jumps
+        utcOffsetMs = 0.85 * utcOffsetMs + 0.15 * newOffset;
     }
     function nowUtcMs() { return nowMs() + utcOffsetMs; }
     // Periodically refine UTC offset to reduce drift (tolerant to failures)
@@ -103,6 +128,7 @@
     let writeTicker = null;
     let readyForWrites = false;
     function onYouTubeIframeAPIReady() {
+        if (mode !== 'yt') return; // ignore if using native
         player = new YT.Player('player', {
             videoId: 'syZgEDz_R28',
             playerVars: {
@@ -132,8 +158,10 @@
             document.getElementById("status").textContent = "Ready";
             try { videoDurationSec = player.getDuration() || 0; } catch (e) {}
             try { await refreshUtcOffset(1); } catch (e) {}
-            try { syncToTarget(true); } catch (e) {}
-            attemptAutoplay();
+            try {
+                await refreshUtcOffset(2);
+                await schedulePreciseStart();
+            } catch (e) { try { syncToTarget(true); } catch (e2) {} }
             readyForWrites = true;
         })();
     }
@@ -182,7 +210,6 @@
     }
     function attemptAutoplay() {
         try { player.playVideo(); } catch (e) {}
-        // If not playing shortly, show overlay for user gesture
         setTimeout(() => { if (!isPlaying()) showOverlay(); }, 1200);
     }
     function showOverlay() {
@@ -193,9 +220,13 @@
         const ov = document.getElementById('autoplayOverlay');
         if (ov) ov.style.display = 'none';
     }
-    document.getElementById('startPlayback').addEventListener('click', () => {
+    document.getElementById('startPlayback').addEventListener('click', async () => {
         hideOverlay();
-        try { player.playVideo(); } catch (e) {}
+        if (mode === 'yt') {
+            try { await schedulePreciseStart(); } catch { try { player.playVideo(); } catch (e) {} }
+        } else {
+            try { video.play(); } catch {}
+        }
     });
 
     // UTC link-based sync and countdown removed for minimal setup
@@ -207,6 +238,26 @@
         if (dur <= 0) return 0;
         const pos = ((effectiveUtcMs() - anchorMs) / 1000) % dur;
         return Math.max(0, Math.min(dur - 0.2, pos));
+    }
+    async function schedulePreciseStart() {
+        // Pause, compute a start moment ~600ms in future, seek to that position, then resume precisely
+        try { player.pauseVideo(); } catch {}
+        const dur = Number(periodSecParam || videoDurationSec) || 0;
+        if (dur <= 0) { attemptAutoplay(); return; }
+        const resumeAtUtcMs = nowUtcMs() + 600;
+        const resumePos = ((resumeAtUtcMs - anchorMs) / 1000) % dur;
+        try { player.seekTo(resumePos, true); } catch {}
+        // coarse wait then fine spin
+        const coarseDelay = Math.max(0, resumeAtUtcMs - nowUtcMs() - 40);
+        await new Promise(r => setTimeout(r, coarseDelay));
+        const step = () => {
+            if (nowUtcMs() >= resumeAtUtcMs - 5) {
+                try { player.playVideo(); } catch {}
+            } else {
+                requestAnimationFrame(step);
+            }
+        };
+        requestAnimationFrame(step);
     }
     function syncToTarget(force = false) {
         const target = computeUtcTargetPositionSec();
@@ -263,9 +314,89 @@
 
     // No shared state writes; synchronization is derived from UTC
 
-    let tag = document.createElement('script');
-    tag.src = "https://www.youtube.com/iframe_api";
-    document.body.appendChild(tag);
+    // Optional native <video> high-precision mode
+    if (mode === 'native') {
+        const host = document.getElementById('player');
+        const video = document.createElement('video');
+        video.id = 'video';
+        video.controls = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        video.style.maxWidth = '100%';
+        video.style.width = '100%';
+        video.style.background = '#000';
+        if (nativeSrc) {
+            const src = document.createElement('source');
+            src.src = nativeSrc;
+            src.type = 'video/mp4';
+            video.appendChild(src);
+        }
+        host.appendChild(video);
+
+        let hasStarted = false;
+        const TARGET_TOLERANCE_SEC = 0.01;
+        const SEEK_THRESHOLD_SEC = 0.35;
+        const MAX_RATE_DELTA = 0.03;
+        const KP = 0.7;
+        const KI = 0.06;
+        let integralError = 0;
+        let lastFrameTs = 0;
+
+        function wrapErrorToPeriod(err, periodSec) {
+            if (periodSec <= 0) return err;
+            return ((err + periodSec / 2) % periodSec + periodSec) % periodSec - periodSec / 2;
+        }
+        function computeTargetPosSecNative() {
+            const period = Number(periodSecParam || videoDurationSec) || 0;
+            if (period <= 0) return 0;
+            const utcSec = (nowUtcMs() - anchorMs) / 1000;
+            const pos = ((utcSec % period) + period) % period;
+            return Math.max(0, Math.min(period - 0.05, pos));
+        }
+        function applyRateNative(rate) { try { video.playbackRate = rate; } catch {} }
+        function controllerStep(now) {
+            if (!videoDurationSec) return scheduleNextFrame();
+            const period = Number(periodSecParam || videoDurationSec) || 0;
+            const current = video.currentTime || 0;
+            const target = computeTargetPosSecNative();
+            let error = wrapErrorToPeriod(target - current, period);
+            const dt = lastFrameTs ? Math.max(0.005, (now - lastFrameTs) / 1000) : 0.016;
+            lastFrameTs = now;
+
+            if (Math.abs(error) >= SEEK_THRESHOLD_SEC) {
+                try { video.currentTime = target; } catch {}
+                applyRateNative(1.0);
+                integralError = 0;
+                document.getElementById('status').textContent = `Corrected drift (${Math.abs(error).toFixed(3)}s)`;
+                return scheduleNextFrame();
+            }
+
+            integralError = Math.max(-1.0, Math.min(1.0, integralError + error * dt));
+            const control = KP * error + KI * integralError;
+            const desiredRate = Math.max(1 - MAX_RATE_DELTA, Math.min(1 + MAX_RATE_DELTA, 1 + control));
+            if (Math.abs(error) <= TARGET_TOLERANCE_SEC) applyRateNative(1.0); else applyRateNative(desiredRate);
+            scheduleNextFrame();
+        }
+        function scheduleNextFrame() {
+            if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(controllerStep);
+            else setTimeout(() => controllerStep(performance.now()), 16);
+        }
+        video.addEventListener('loadedmetadata', async () => {
+            videoDurationSec = Number(video.duration) || 0;
+            document.getElementById('status').textContent = 'Ready';
+            try { await refreshUtcOffset(2); } catch {}
+            try { video.currentTime = computeTargetPosSecNative(); } catch {}
+            try { await video.play(); } catch { showOverlay(); }
+            if (!hasStarted) { hasStarted = true; scheduleNextFrame(); }
+        });
+        video.addEventListener('play', () => { if (!hasStarted) { hasStarted = true; scheduleNextFrame(); } });
+        video.addEventListener('ended', () => { applyRateNative(1.0); });
+    } else {
+        // Load YouTube API if using yt mode
+        let tag = document.createElement('script');
+        tag.src = "https://www.youtube.com/iframe_api";
+        document.body.appendChild(tag);
+    }
 </script>
 
 </body>
