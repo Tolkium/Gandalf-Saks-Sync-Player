@@ -52,6 +52,23 @@
     </div>
 
 <script>
+    const urlParams = new URLSearchParams(location.search);
+    // Optional UTC anchor and period overrides for deterministic alignment across reloads
+    let anchorMs = (() => {
+        const t0 = urlParams.get('t0');
+        if (!t0) return 0;
+        const n = Number(t0);
+        if (Number.isFinite(n)) return n;
+        const p = Date.parse(t0);
+        return Number.isFinite(p) ? p : 0;
+    })();
+    let periodSecParam = (() => {
+        const pms = urlParams.get('periodMs');
+        const ps = urlParams.get('period');
+        if (pms && Number.isFinite(Number(pms))) return Number(pms) / 1000;
+        if (ps && Number.isFinite(Number(ps))) return Number(ps);
+        return null;
+    })();
     // Stateless UTC-based sync (no backend, no CORS):
     // All clients compute the same position from a shared UTC clock.
     function nowMs() { return Date.now(); }
@@ -185,9 +202,9 @@
     // Stateless, UTC-based target and periodic drift correction
     function effectiveUtcMs() { return nowUtcMs(); }
     function computeUtcTargetPositionSec() {
-        const dur = Number(videoDurationSec) || 0;
+        const dur = Number(periodSecParam || videoDurationSec) || 0;
         if (dur <= 0) return 0;
-        const pos = (effectiveUtcMs() / 1000) % dur;
+        const pos = ((effectiveUtcMs() - anchorMs) / 1000) % dur;
         return Math.max(0, Math.min(dur - 0.2, pos));
     }
     function syncToTarget(force = false) {
@@ -222,7 +239,13 @@
             const slower = rates.filter(r => r < 1).sort((a,b)=>b-a)[0] ?? 0.75;
             const wantFaster = driftSec > 0; // we are behind; need to catch up
             const targetRate = wantFaster ? faster : slower;
-            if (!targetRate || targetRate === 1) return;
+            if (!targetRate || targetRate === 1) {
+                // Fallback: micro seek if only 1x available
+                const micro = Math.sign(driftSec) * Math.max(0.06, Math.min(0.18, Math.abs(driftSec) * 0.9));
+                const cur = player.getCurrentTime ? player.getCurrentTime() : 0;
+                try { player.seekTo(cur + micro, true); } catch (e) {}
+                return;
+            }
             const delta = Math.abs(targetRate - 1);
             // Time to apply to correct a fraction (avoid overshoot)
             const correctionPortion = 0.85;
