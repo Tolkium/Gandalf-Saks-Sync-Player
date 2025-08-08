@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Gandalf Saks Sync Player</title>
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        background: #121212;
+        color: white;
+        text-align: center;
+        padding: 20px;
+    }
+    input, button {
+        font-size: 16px;
+        padding: 5px;
+        margin: 5px;
+    }
+    #status {
+        margin-top: 10px;
+        font-weight: bold;
+    }
+    #debug {
+        margin-top: 20px;
+        font-size: 14px;
+        color: #ccc;
+        text-align: left;
+        display: inline-block;
+    }
+</style>
+</head>
+<body>
+
+<h1>Gandalf Saks Sync Player</h1>
+
+<div>
+    Loop length (ms): 
+    <input type="number" id="loopLength" value="6000" min="100" step="100">
+    <button id="saveSettings">Save</button>
+</div>
+
+<div id="player"></div>
+
+<div id="status">Loading...</div>
+
+<div id="debug"></div>
+
+<script>
+    const GLOBAL_START_TIME = new Date("2025-01-01T00:00:00Z").getTime();
+    let loopLengthMs = localStorage.getItem("loopLengthMs") || 6000;
+
+    let player;
+    function onYouTubeIframeAPIReady() {
+        player = new YT.Player('player', {
+            videoId: 'xL8-y3oX1R0',
+            playerVars: {
+                autoplay: 1,
+                controls: 1,
+                modestbranding: 1,
+                loop: 1,
+                playlist: 'xL8-y3oX1R0',
+                rel: 0
+            },
+            events: {
+                'onReady': onPlayerReady
+            }
+        });
+    }
+
+    function onPlayerReady() {
+        setInterval(syncLoop, 500);
+    }
+
+    function getIdealPosition() {
+        const now = Date.now();
+        const elapsed = (now - GLOBAL_START_TIME) % loopLengthMs;
+        return elapsed / 1000;
+    }
+
+    function syncLoop() {
+        if (!player || typeof player.getCurrentTime !== "function") return;
+
+        const ideal = getIdealPosition();
+        const current = player.getCurrentTime();
+        const drift = current - ideal;
+
+        if (Math.abs(drift) > 0.2) {
+            player.seekTo(ideal, true);
+            document.getElementById("status").textContent = "Resynced";
+        } else {
+            document.getElementById("status").textContent = "In Sync";
+        }
+
+        document.getElementById("debug").innerHTML =
+            `<strong>Loop length:</strong> ${loopLengthMs} ms<br>` +
+            `<strong>Ideal position:</strong> ${ideal.toFixed(3)}s<br>` +
+            `<strong>Video time:</strong> ${current.toFixed(3)}s<br>` +
+            `<strong>Drift:</strong> ${drift.toFixed(3)}s`;
+    }
+
+    document.getElementById("saveSettings").addEventListener("click", () => {
+        const val = parseInt(document.getElementById("loopLength").value);
+        if (!isNaN(val) && val > 100) {
+            loopLengthMs = val;
+            localStorage.setItem("loopLengthMs", loopLengthMs);
+        }
+    });
+
+    document.getElementById("loopLength").value = loopLengthMs;
+
+    let tag = document.createElement('script');
+    tag.src = "https://www.youtube.com/iframe_api";
+    document.body.appendChild(tag);
+</script>
+
+</body>
+</html>
