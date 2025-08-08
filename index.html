@@ -78,8 +78,8 @@
         }
     }
     function nowUtcMs() { return nowMs() + utcOffsetMs; }
-    // Periodically refine UTC offset to reduce drift
-    setInterval(() => { refreshUtcOffset(3); }, 30000);
+    // Periodically refine UTC offset to reduce drift (tolerant to failures)
+    setInterval(() => { try { refreshUtcOffset(3); } catch (e) {} }, 120000);
 
     let player;
     let videoDurationSec = 0;
@@ -124,9 +124,11 @@
     let hasInitialSynced = false;
     let pausedSinceLastPlay = false;
     let periodicSyncTimer = null;
-    const SYNC_INTERVAL_MS = 100;
-    const DRIFT_THRESHOLD_SEC = 0.02; // 20 ms target precision
-    let phaseAdjustMs = 0; // learned bias correction per client
+    const SYNC_INTERVAL_MS = 1200;
+    const DRIFT_THRESHOLD_SEC = 0.12; // 120 ms
+    const MAJOR_DRIFT_SEC = 0.5; // always correct immediately
+    const CORRECTION_COOLDOWN_MS = 3000;
+    let lastCorrectionAt = 0;
     async function onPlayerStateChange(event) {
         if (event.data === YT.PlayerState.PLAYING) {
             const isInitial = !hasInitialSynced;
@@ -151,7 +153,7 @@
 
     // Initial world time sync
     (async () => {
-        await refreshUtcOffset(10);
+        await refreshUtcOffset(6);
     })();
 
     // Autoplay helpers
@@ -179,7 +181,7 @@
     // UTC link-based sync and countdown removed for minimal setup
 
     // Stateless, UTC-based target and periodic drift correction
-    function effectiveUtcMs() { return nowUtcMs() + phaseAdjustMs; }
+    function effectiveUtcMs() { return nowUtcMs(); }
     function computeUtcTargetPositionSec() {
         const dur = Number(videoDurationSec) || 0;
         if (dur <= 0) return 0;
@@ -190,15 +192,14 @@
         const target = computeUtcTargetPositionSec();
         let current = 0;
         try { current = player.getCurrentTime ? player.getCurrentTime() : 0; } catch (e) { current = 0; }
-        const drift = Math.abs(current - target);
-        // Update learned phase adjustment (EMA towards eliminating steady bias)
-        const errorMs = (target - current) * 1000;
-        phaseAdjustMs = 0.95 * phaseAdjustMs + 0.05 * errorMs;
-        // Bound phase adjust to avoid runaway
-        if (phaseAdjustMs > 500) phaseAdjustMs = 500; else if (phaseAdjustMs < -500) phaseAdjustMs = -500;
-        if (force || drift > DRIFT_THRESHOLD_SEC) {
+        const drift = target - current; // signed seconds
+        const absDrift = Math.abs(drift);
+        const nowTs = performance.now();
+        const recentlyCorrected = (nowTs - lastCorrectionAt) < CORRECTION_COOLDOWN_MS;
+        if (force || absDrift > MAJOR_DRIFT_SEC || (!recentlyCorrected && absDrift > DRIFT_THRESHOLD_SEC)) {
             try { player.seekTo(target, true); } catch (e) {}
-            if (!force) document.getElementById('status').textContent = `Corrected drift (${drift.toFixed(2)}s)`;
+            lastCorrectionAt = nowTs;
+            if (!force) document.getElementById('status').textContent = `Corrected drift (${absDrift.toFixed(3)}s)`;
         }
     }
     function periodicSyncAdjust() { syncToTarget(false); }
