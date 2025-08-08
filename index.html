@@ -171,6 +171,7 @@
     let periodicSyncTimer = null;
     const SYNC_INTERVAL_MS = 200;
     const PAUSE_MIN_SEC = 0.01;      // use pause/resume above 10ms when ahead
+    const MAX_PAUSE_STEP_SEC = 0.06; // cap each pause segment to 60ms
     const DRIFT_THRESHOLD_SEC = 0.25; // seek if beyond this and not using pause
     const MAJOR_DRIFT_SEC = 0.7;      // always correct immediately via seek
     const CORRECTION_COOLDOWN_MS = 1200;
@@ -301,19 +302,13 @@
             lastCorrectionAt = nowTs;
             return;
         }
-        // If behind a bit, do a tiny forward seek slightly past target based on learned skew
-        if (!recentlyCorrected && drift > PAUSE_MIN_SEC) {
-            const preempt = Math.max(0, Math.min(0.12, skewSecPerSec * 0.6));
-            try { player.seekTo(target + preempt, true); } catch (e) {}
-            lastCorrectionAt = nowTs;
-            document.getElementById('status').textContent = `Corrected drift (${absDrift.toFixed(3)}s)`;
-            return;
-        }
+        // If behind a bit, avoid seeks (YT keyframe granularity causes big jumps). Let the ahead instance pause.
+        // Do nothing here; major drifts still handled above.
     }
     function pauseUntilCatchUp(waitSec) {
         pausePending = true;
         try { player.pauseVideo(); } catch (e) {}
-        const resumeAtUtcMs = nowUtcMs() + waitSec * 1000;
+        const resumeAtUtcMs = nowUtcMs() + Math.min(waitSec, MAX_PAUSE_STEP_SEC) * 1000;
         // Coarse timer then fine rAF spin to hit within ~10-20ms
         const coarseDelay = Math.max(0, waitSec * 1000 - 40);
         setTimeout(() => {
@@ -352,8 +347,7 @@
                         pauseUntilCatchUp(-drift);
                         lastCorrectionAt = performance.now();
                     } else if (drift > TIGHT_BEHIND_MIN_SEC) {
-                        try { player.seekTo(target, true); } catch (e) {}
-                        lastCorrectionAt = performance.now();
+                        // Avoid tiny seeks when behind; rely on the other instance pausing
                     }
                 }
             } catch {}
