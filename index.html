@@ -55,6 +55,12 @@
         <button id="saveSettings">Save</button>
     </div>
 
+    <div style="margin-top:10px;">
+        <input type="text" id="pantryId" placeholder="Pantry ID (getpantry.cloud)" style="width:40%;">
+        <input type="text" id="roomId" placeholder="Room / basket name" style="width:30%;">
+        <button id="connectRoom">Connect free sync</button>
+    </div>
+
 <div id="player"></div>
 
 <div id="status">Loading...</div>
@@ -78,6 +84,11 @@
     const GLOBAL_START_TIME = new Date("2025-01-01T00:00:00Z").getTime();
     let loopLengthMs = Number(urlParams.get('len')) || Number(localStorage.getItem("loopLengthMs")) || 7500;
     const SESSION_START_TIME_MS = Number(urlParams.get('t0')) || GLOBAL_START_TIME;
+
+    // Free sync config via GetPantry (no signup, free). You can also pass via URL: ?pantry=...&room=...
+    const DEFAULT_PANTRY_ID = 'a7183995-e0b0-46b1-bcf0-c2119c005931';
+    let pantryId = urlParams.get('pantry') || localStorage.getItem('pantryId') || DEFAULT_PANTRY_ID;
+    let roomId = urlParams.get('room') || localStorage.getItem('roomId') || '';
 
     // Maintain an offset between server clock and client clock so all devices
     // use a common time reference regardless of local clock skew.
@@ -120,6 +131,9 @@
     }
 
     let player;
+    let videoDurationSec = 0;
+    let writeTicker = null;
+    let readyForWrites = false;
     function onYouTubeIframeAPIReady() {
         player = new YT.Player('player', {
             videoId: 'syZgEDz_R28',
@@ -157,6 +171,13 @@
                 attemptAutoplay();
             }
             document.getElementById("status").textContent = "Ready";
+            // Cache duration
+            try { videoDurationSec = player.getDuration() || 0; } catch (e) {}
+            // If pantry/room configured, do an initial fetch to align before first play if needed
+            if (pantryId && roomId) {
+                try { await syncFromRemoteOnce(); } catch (e) {}
+            }
+            readyForWrites = true;
         })();
     }
 
@@ -167,20 +188,33 @@
             const isInitial = !hasInitialSynced;
             if (isInitial || pausedSinceLastPlay) {
                 await refreshServerTimeOffset();
-                const ideal = getIdealPosition();
-                try { player.seekTo(ideal, true); } catch (e) {}
+                // Prefer remote shared state if configured; otherwise use UTC-based ideal
+                if (pantryId && roomId) {
+                    await syncFromRemoteOnce();
+                } else {
+                    const ideal = getIdealPosition();
+                    try { player.seekTo(ideal, true); } catch (e) {}
+                }
                 hasInitialSynced = true;
                 pausedSinceLastPlay = false;
                 document.getElementById("status").textContent = isInitial ? "Synced on join" : "Resynced after resume";
                 document.getElementById("debug").innerHTML =
                     `<strong>Loop length:</strong> ${loopLengthMs} ms<br>` +
-                    `<strong>Ideal position:</strong> ${ideal.toFixed(3)}s<br>` +
-                    `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms<br>` +
-                    `<strong>Session t0:</strong> ${SESSION_START_TIME_MS}`;
+                    (pantryId && roomId ? `<strong>Remote room:</strong> ${roomId}<br>` : '') +
+                    `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms`;
             }
             hideOverlay();
+            // Start write ticker while playing
+            if (!writeTicker && pantryId && roomId && readyForWrites) {
+                writeTicker = setInterval(writeNowStateThrottled, 5000);
+            }
         } else if (event.data === YT.PlayerState.PAUSED) {
             pausedSinceLastPlay = true;
+            // Write a final paused state snapshot
+            if (pantryId && roomId && readyForWrites) {
+                writeNowStateThrottled(true);
+            }
+            if (writeTicker) { clearInterval(writeTicker); writeTicker = null; }
         } else if (event.data === YT.PlayerState.UNSTARTED) {
             // Some browsers report UNSTARTED if autoplay is blocked
             showOverlay();
@@ -205,6 +239,26 @@
     });
 
     document.getElementById("loopLength").value = loopLengthMs;
+
+    // Initialize free sync inputs
+    const pantryEl = document.getElementById('pantryId');
+    const roomEl = document.getElementById('roomId');
+    pantryEl.value = pantryId;
+    roomEl.value = roomId;
+    document.getElementById('connectRoom').addEventListener('click', () => {
+        pantryId = pantryEl.value.trim();
+        roomId = roomEl.value.trim();
+        localStorage.setItem('pantryId', pantryId);
+        localStorage.setItem('roomId', roomId);
+        document.getElementById('status').textContent = pantryId && roomId ? `Connected to room ${roomId}` : 'Disconnected from remote';
+        // Pull current shared state immediately on connect
+        if (pantryId && roomId) {
+            (async () => {
+                await refreshServerTimeOffset(3);
+                await syncFromRemoteOnce();
+            })();
+        }
+    });
 
     // Kick off server time sync once; periodic refresh optional but harmless
     refreshServerTimeOffset(5);
@@ -256,12 +310,85 @@
         // target ~5s ahead aligned to next second
         const target = Math.ceil((now + 5000) / 1000) * 1000;
         const base = location.origin + location.pathname;
-        const url = `${base}?t0=${Math.round(target)}&len=${loopLengthMs}`;
+        const url = `${base}?t0=${Math.round(target)}&len=${loopLengthMs}` + (pantryId?`&pantry=${encodeURIComponent(pantryId)}`:'') + (roomId?`&room=${encodeURIComponent(roomId)}`:'');
         const input = document.getElementById('shareLink');
         input.value = url;
         try { await navigator.clipboard.writeText(url); } catch (e) {}
         document.getElementById("status").textContent = "Sync link copied (starts in ~5s)";
     });
+
+    // ---------- Free API (GetPantry) state sync ----------
+    function pantryBasketUrl() {
+        if (!pantryId || !roomId) return null;
+        return `https://getpantry.cloud/apiv1/pantry/${encodeURIComponent(pantryId)}/basket/${encodeURIComponent(roomId)}`;
+    }
+
+    async function getSharedState() {
+        const url = pantryBasketUrl();
+        if (!url) return null;
+        try {
+            const res = await fetch(url, { method: 'GET', cache: 'no-store' });
+            if (!res.ok) return null;
+            return await res.json();
+        } catch {
+            return null;
+        }
+    }
+
+    async function setSharedState(state) {
+        const url = pantryBasketUrl();
+        if (!url) return false;
+        try {
+            const res = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state) });
+            return res.ok;
+        } catch {
+            return false;
+        }
+    }
+
+    function computeDerivedPosition(remote) {
+        if (!remote) return null;
+        const base = Number(remote.positionSec) || 0;
+        const updatedAt = Number(remote.updatedAtMs) || 0;
+        const wasPlaying = !!remote.isPlaying;
+        let derived = base;
+        if (wasPlaying && updatedAt > 0) {
+            const deltaSec = Math.max(0, (nowMs() - updatedAt) / 1000);
+            derived = base + deltaSec;
+        }
+        if (videoDurationSec > 0) {
+            derived = Math.min(derived, videoDurationSec - 0.25);
+        }
+        return derived;
+    }
+
+    async function syncFromRemoteOnce() {
+        const remote = await getSharedState();
+        if (!remote) return;
+        const target = computeDerivedPosition(remote);
+        if (target == null) return;
+        try { player.seekTo(target, true); } catch (e) {}
+    }
+
+    let lastWriteMs = 0;
+    async function writeNowStateThrottled(force = false) {
+        if (!readyForWrites || !pantryId || !roomId) return;
+        const now = Date.now();
+        if (!force && now - lastWriteMs < 2000) return;
+        lastWriteMs = now;
+        try {
+            const isPlaying = player.getPlayerState && player.getPlayerState() === YT.PlayerState.PLAYING;
+            const positionSec = player.getCurrentTime ? player.getCurrentTime() : 0;
+            const state = {
+                videoId: 'syZgEDz_R28',
+                positionSec,
+                isPlaying,
+                updatedAtMs: nowMs(),
+                loopLengthMs
+            };
+            await setSharedState(state);
+        } catch {}
+    }
 
     let tag = document.createElement('script');
     tag.src = "https://www.youtube.com/iframe_api";
