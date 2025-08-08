@@ -41,6 +41,8 @@
         padding: 12px 24px;
         cursor: pointer;
     }
+    #overlayContent { text-align: center; }
+    #overlayText { font-size: 18px; margin-bottom: 12px; }
 </style>
 </head>
 <body>
@@ -60,34 +62,56 @@
 <div id="debug"></div>
 
 <div id="autoplayOverlay">
-    <button id="startPlayback">Tap to start</button>
+    <div id="overlayContent">
+        <div id="overlayText">Tap to start</div>
+        <button id="startPlayback">Tap to start</button>
+    </div>
+    </div>
+
+<div style="margin-top:10px;">
+    <button id="makeLink">Create sync link (start in 5s)</button>
+    <input id="shareLink" style="width:80%;" readonly>
     </div>
 
 <script>
+    const urlParams = new URLSearchParams(location.search);
     const GLOBAL_START_TIME = new Date("2025-01-01T00:00:00Z").getTime();
-    let loopLengthMs = Number(localStorage.getItem("loopLengthMs")) || 7500;
+    let loopLengthMs = Number(urlParams.get('len')) || Number(localStorage.getItem("loopLengthMs")) || 7500;
+    const SESSION_START_TIME_MS = Number(urlParams.get('t0')) || GLOBAL_START_TIME;
 
     // Maintain an offset between server clock and client clock so all devices
     // use a common time reference regardless of local clock skew.
     let serverTimeOffsetMs = 0; // server_now_ms - client_now_ms
 
-    async function refreshServerTimeOffset() {
+    async function fetchServerDateHead() {
+        const t0 = Date.now();
+        const res = await fetch(location.href + (location.href.includes('?') ? '&' : '?') + 'nocache=' + Math.random(), {
+            method: 'HEAD',
+            cache: 'no-store'
+        });
+        const t2 = Date.now();
+        const dateHeader = res.headers.get('Date');
+        if (!dateHeader) return null;
+        const serverNow = new Date(dateHeader).getTime();
+        const clientMid = (t0 + t2) / 2;
+        return { offset: serverNow - clientMid };
+    }
+
+    async function refreshServerTimeOffset(samples = 5) {
         try {
-            const t0 = Date.now();
-            // Use HEAD to get the Date header; bust caches to avoid stale dates
-            const res = await fetch(location.href + (location.href.includes('?') ? '&' : '?') + 'nocache=' + Math.random(), {
-                method: 'HEAD',
-                cache: 'no-store'
-            });
-            const t2 = Date.now();
-            const dateHeader = res.headers.get('Date');
-            if (dateHeader) {
-                const serverNow = new Date(dateHeader).getTime();
-                const clientMid = (t0 + t2) / 2;
-                serverTimeOffsetMs = serverNow - clientMid;
+            const offsets = [];
+            for (let i = 0; i < samples; i += 1) {
+                const res = await fetchServerDateHead();
+                if (res) offsets.push(res.offset);
+                await new Promise(r => setTimeout(r, 60));
+            }
+            if (offsets.length) {
+                offsets.sort((a,b)=>a-b);
+                const mid = Math.floor(offsets.length/2);
+                serverTimeOffsetMs = offsets.length % 2 === 1 ? offsets[mid] : Math.round((offsets[mid-1]+offsets[mid])/2);
             }
         } catch (e) {
-            // Leave offset unchanged on failure
+            // Leave previous offset
         }
     }
 
@@ -122,8 +146,18 @@
         try {
             player.getIframe().setAttribute('allow', 'autoplay; encrypted-media; picture-in-picture');
         } catch (e) {}
-        attemptAutoplay();
-        document.getElementById("status").textContent = "Ready (attempting autoplay)";
+        (async () => {
+            await refreshServerTimeOffset(5);
+            // If session start is in the future, show countdown and start then
+            const until = SESSION_START_TIME_MS - nowMs();
+            if (until > 500) {
+                startCountdownTo(SESSION_START_TIME_MS);
+                try { player.pauseVideo(); } catch (e) {}
+            } else {
+                attemptAutoplay();
+            }
+            document.getElementById("status").textContent = "Ready";
+        })();
     }
 
     let hasInitialSynced = false;
@@ -141,7 +175,8 @@
                 document.getElementById("debug").innerHTML =
                     `<strong>Loop length:</strong> ${loopLengthMs} ms<br>` +
                     `<strong>Ideal position:</strong> ${ideal.toFixed(3)}s<br>` +
-                    `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms`;
+                    `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms<br>` +
+                    `<strong>Session t0:</strong> ${SESSION_START_TIME_MS}`;
             }
             hideOverlay();
         } else if (event.data === YT.PlayerState.PAUSED) {
@@ -154,7 +189,7 @@
 
     function getIdealPosition() {
         const now = nowMs();
-        const elapsed = (now - GLOBAL_START_TIME) % loopLengthMs;
+        const elapsed = (now - SESSION_START_TIME_MS) % loopLengthMs;
         return elapsed / 1000;
     }
 
@@ -172,7 +207,7 @@
     document.getElementById("loopLength").value = loopLengthMs;
 
     // Kick off server time sync once; periodic refresh optional but harmless
-    refreshServerTimeOffset();
+    refreshServerTimeOffset(5);
 
     // Autoplay helpers
     function isPlaying() {
@@ -194,6 +229,38 @@
     document.getElementById('startPlayback').addEventListener('click', () => {
         hideOverlay();
         try { player.playVideo(); } catch (e) {}
+    });
+
+    function startCountdownTo(targetMs) {
+        showOverlay();
+        const btn = document.getElementById('startPlayback');
+        const txt = document.getElementById('overlayText');
+        if (btn) btn.style.display = 'none';
+        let timer = null;
+        const tick = () => {
+            const remaining = Math.max(0, targetMs - nowMs());
+            if (txt) txt.textContent = `Starting in ${(remaining/1000).toFixed(1)}s`;
+            if (remaining <= 60) {
+                clearInterval(timer);
+                hideOverlay();
+                try { player.playVideo(); } catch (e) {}
+            }
+        };
+        tick();
+        timer = setInterval(tick, 100);
+    }
+
+    document.getElementById('makeLink').addEventListener('click', async () => {
+        await refreshServerTimeOffset(5);
+        const now = nowMs();
+        // target ~5s ahead aligned to next second
+        const target = Math.ceil((now + 5000) / 1000) * 1000;
+        const base = location.origin + location.pathname;
+        const url = `${base}?t0=${Math.round(target)}&len=${loopLengthMs}`;
+        const input = document.getElementById('shareLink');
+        input.value = url;
+        try { await navigator.clipboard.writeText(url); } catch (e) {}
+        document.getElementById("status").textContent = "Sync link copied (starts in ~5s)";
     });
 
     let tag = document.createElement('script');
