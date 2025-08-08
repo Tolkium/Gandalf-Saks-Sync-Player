@@ -177,6 +177,10 @@
     let lastCorrectionAt = 0;
     let pausePending = false;
     let pauseResumeRaf = 0;
+    // Drift learning (use last correction to predict next)
+    let lastDriftSec = null;
+    let lastDriftTsMs = null;
+    let skewSecPerSec = 0; // estimated drift slope (seconds drift per second)
     async function onPlayerStateChange(event) {
         if (event.data === YT.PlayerState.PLAYING) {
             const isInitial = !hasInitialSynced;
@@ -266,6 +270,15 @@
         const drift = target - current; // signed seconds (positive => behind)
         const absDrift = Math.abs(drift);
         const nowTs = performance.now();
+        // Update skew estimate from last observation
+        if (lastDriftTsMs != null) {
+            const dtSec = Math.max(0.01, (nowTs - lastDriftTsMs) / 1000);
+            const rate = (drift - (lastDriftSec ?? drift)) / dtSec;
+            // Smooth with small learning rate to avoid noise
+            skewSecPerSec = 0.9 * skewSecPerSec + 0.1 * rate;
+        }
+        lastDriftSec = drift;
+        lastDriftTsMs = nowTs;
         const recentlyCorrected = (nowTs - lastCorrectionAt) < CORRECTION_COOLDOWN_MS;
 
         // Major corrections: single seek
@@ -282,9 +295,10 @@
             lastCorrectionAt = nowTs;
             return;
         }
-        // If behind a bit, do a tiny forward seek to the target
+        // If behind a bit, do a tiny forward seek slightly past target based on learned skew
         if (!recentlyCorrected && drift > PAUSE_MIN_SEC) {
-            try { player.seekTo(target, true); } catch (e) {}
+            const preempt = Math.max(0, Math.min(0.12, skewSecPerSec * 0.6));
+            try { player.seekTo(target + preempt, true); } catch (e) {}
             lastCorrectionAt = nowTs;
             document.getElementById('status').textContent = `Corrected drift (${absDrift.toFixed(3)}s)`;
             return;
