@@ -124,11 +124,13 @@
     let hasInitialSynced = false;
     let pausedSinceLastPlay = false;
     let periodicSyncTimer = null;
-    const SYNC_INTERVAL_MS = 1200;
-    const DRIFT_THRESHOLD_SEC = 0.12; // 120 ms
-    const MAJOR_DRIFT_SEC = 0.5; // always correct immediately
-    const CORRECTION_COOLDOWN_MS = 3000;
+    const SYNC_INTERVAL_MS = 500;
+    const SMOOTH_DRIFT_MIN_SEC = 0.08; // use rate nudge above this
+    const DRIFT_THRESHOLD_SEC = 0.25; // seek only if above this AND not smoothable
+    const MAJOR_DRIFT_SEC = 0.6; // always correct immediately via seek
+    const CORRECTION_COOLDOWN_MS = 2500;
     let lastCorrectionAt = 0;
+    let rateCorrectionTimer = null;
     async function onPlayerStateChange(event) {
         if (event.data === YT.PlayerState.PLAYING) {
             const isInitial = !hasInitialSynced;
@@ -192,15 +194,46 @@
         const target = computeUtcTargetPositionSec();
         let current = 0;
         try { current = player.getCurrentTime ? player.getCurrentTime() : 0; } catch (e) { current = 0; }
-        const drift = target - current; // signed seconds
+        const drift = target - current; // signed seconds (positive => behind)
         const absDrift = Math.abs(drift);
         const nowTs = performance.now();
         const recentlyCorrected = (nowTs - lastCorrectionAt) < CORRECTION_COOLDOWN_MS;
-        if (force || absDrift > MAJOR_DRIFT_SEC || (!recentlyCorrected && absDrift > DRIFT_THRESHOLD_SEC)) {
+
+        // Major corrections: single seek
+        if (force || absDrift >= MAJOR_DRIFT_SEC || (!recentlyCorrected && absDrift >= DRIFT_THRESHOLD_SEC)) {
             try { player.seekTo(target, true); } catch (e) {}
             lastCorrectionAt = nowTs;
             if (!force) document.getElementById('status').textContent = `Corrected drift (${absDrift.toFixed(3)}s)`;
+            return;
         }
+
+        // Smooth corrections using temporary playbackRate nudge
+        if (!recentlyCorrected && absDrift >= SMOOTH_DRIFT_MIN_SEC && !rateCorrectionTimer) {
+            applyRateNudge(drift);
+            lastCorrectionAt = nowTs;
+        }
+    }
+    function applyRateNudge(driftSec) {
+        try {
+            if (!player || !player.getAvailablePlaybackRates || !player.setPlaybackRate) return;
+            const rates = player.getAvailablePlaybackRates();
+            if (!Array.isArray(rates) || rates.length === 0) return;
+            const faster = rates.filter(r => r > 1).sort((a,b)=>a-b)[0] ?? 1.25;
+            const slower = rates.filter(r => r < 1).sort((a,b)=>b-a)[0] ?? 0.75;
+            const wantFaster = driftSec > 0; // we are behind; need to catch up
+            const targetRate = wantFaster ? faster : slower;
+            if (!targetRate || targetRate === 1) return;
+            const delta = Math.abs(targetRate - 1);
+            // Time to apply to correct a fraction (avoid overshoot)
+            const correctionPortion = 0.85;
+            const neededMs = Math.min(1200, Math.max(250, (Math.abs(driftSec) / delta) * 1000 * correctionPortion));
+            player.setPlaybackRate(targetRate);
+            if (rateCorrectionTimer) clearTimeout(rateCorrectionTimer);
+            rateCorrectionTimer = setTimeout(() => {
+                try { player.setPlaybackRate(1.0); } catch (e) {}
+                rateCorrectionTimer = null;
+            }, neededMs);
+        } catch (e) {}
     }
     function periodicSyncAdjust() { syncToTarget(false); }
 
