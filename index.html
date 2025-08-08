@@ -56,29 +56,30 @@
     // All clients compute the same position from a shared UTC clock.
     function nowMs() { return Date.now(); }
     let utcOffsetMs = 0; // world UTC ~= nowMs() + utcOffsetMs
-    async function refreshUtcOffset(sampleCount = 3) {
-        const offsets = [];
+    async function refreshUtcOffset(sampleCount = 7) {
+        let best = null; // {offset, rtt}
         for (let i = 0; i < sampleCount; i++) {
             try {
                 const t0 = performance.now();
-                // CORS-friendly time API
                 const res = await fetch('https://worldtimeapi.org/api/timezone/Etc/UTC', { cache: 'no-store' });
                 const t1 = performance.now();
                 if (!res.ok) continue;
                 const data = await res.json();
-                // unixtime is in seconds
                 const serverUtcMs = (data.unixtime || Math.floor(Date.parse(data.utc_datetime) / 1000)) * 1000;
                 const rtt = t1 - t0;
                 const estimatedServerNow = serverUtcMs + rtt / 2;
-                offsets.push(estimatedServerNow - nowMs());
+                const offset = estimatedServerNow - nowMs();
+                if (!best || rtt < best.rtt) best = { offset, rtt };
             } catch {}
         }
-        if (offsets.length > 0) {
-            offsets.sort((a, b) => a - b);
-            utcOffsetMs = offsets[Math.floor(offsets.length / 2)];
+        if (best) {
+            // Smooth to avoid sudden jumps
+            utcOffsetMs = 0.8 * utcOffsetMs + 0.2 * best.offset;
         }
     }
     function nowUtcMs() { return nowMs() + utcOffsetMs; }
+    // Periodically refine UTC offset to reduce drift
+    setInterval(() => { refreshUtcOffset(3); }, 30000);
 
     let player;
     let videoDurationSec = 0;
@@ -123,6 +124,9 @@
     let hasInitialSynced = false;
     let pausedSinceLastPlay = false;
     let periodicSyncTimer = null;
+    const SYNC_INTERVAL_MS = 100;
+    const DRIFT_THRESHOLD_SEC = 0.02; // 20 ms target precision
+    let phaseAdjustMs = 0; // learned bias correction per client
     async function onPlayerStateChange(event) {
         if (event.data === YT.PlayerState.PLAYING) {
             const isInitial = !hasInitialSynced;
@@ -134,7 +138,7 @@
             }
             hideOverlay();
             if (!periodicSyncTimer) {
-                periodicSyncTimer = setInterval(periodicSyncAdjust, 2000);
+                periodicSyncTimer = setInterval(periodicSyncAdjust, SYNC_INTERVAL_MS);
             }
         } else if (event.data === YT.PlayerState.PAUSED) {
             pausedSinceLastPlay = true;
@@ -147,7 +151,7 @@
 
     // Initial world time sync
     (async () => {
-        await refreshUtcOffset(3);
+        await refreshUtcOffset(10);
     })();
 
     // Autoplay helpers
@@ -175,10 +179,11 @@
     // UTC link-based sync and countdown removed for minimal setup
 
     // Stateless, UTC-based target and periodic drift correction
+    function effectiveUtcMs() { return nowUtcMs() + phaseAdjustMs; }
     function computeUtcTargetPositionSec() {
         const dur = Number(videoDurationSec) || 0;
         if (dur <= 0) return 0;
-        const pos = (nowUtcMs() / 1000) % dur;
+        const pos = (effectiveUtcMs() / 1000) % dur;
         return Math.max(0, Math.min(dur - 0.2, pos));
     }
     function syncToTarget(force = false) {
@@ -186,7 +191,12 @@
         let current = 0;
         try { current = player.getCurrentTime ? player.getCurrentTime() : 0; } catch (e) { current = 0; }
         const drift = Math.abs(current - target);
-        if (force || drift > 0.25) {
+        // Update learned phase adjustment (EMA towards eliminating steady bias)
+        const errorMs = (target - current) * 1000;
+        phaseAdjustMs = 0.95 * phaseAdjustMs + 0.05 * errorMs;
+        // Bound phase adjust to avoid runaway
+        if (phaseAdjustMs > 500) phaseAdjustMs = 500; else if (phaseAdjustMs < -500) phaseAdjustMs = -500;
+        if (force || drift > DRIFT_THRESHOLD_SEC) {
             try { player.seekTo(target, true); } catch (e) {}
             if (!force) document.getElementById('status').textContent = `Corrected drift (${drift.toFixed(2)}s)`;
         }
