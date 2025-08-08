@@ -120,13 +120,27 @@
         utcOffsetMs = 0.85 * utcOffsetMs + 0.15 * newOffset;
     }
     function nowUtcMs() { return nowMs() + utcOffsetMs; }
-    // Periodically refine UTC offset to reduce drift (tolerant to failures)
-    setInterval(() => { try { refreshUtcOffset(3); } catch (e) {} }, 120000);
+    // Periodically refine UTC offset to reduce drift (paused during playback)
+    let utcRefreshTimer = 0;
+    function startUtcRefreshLoop() {
+        if (utcRefreshTimer) return;
+        utcRefreshTimer = setInterval(() => { try { refreshUtcOffset(2); } catch (e) {} }, 180000);
+    }
+    function stopUtcRefreshLoop() {
+        if (!utcRefreshTimer) return;
+        clearInterval(utcRefreshTimer);
+        utcRefreshTimer = 0;
+    }
+    startUtcRefreshLoop();
 
     let player;
     let videoDurationSec = 0;
     let writeTicker = null;
     let readyForWrites = false;
+    // Stable phase anchor: freeze UTC reference to local perf clock once playing starts
+    let phaseBaseUtcMs = 0;
+    let phaseBasePerfMs = 0;
+    let phaseAnchored = false;
     function onYouTubeIframeAPIReady() {
         if (mode !== 'yt') return; // ignore if using native
         player = new YT.Player('player', {
@@ -197,6 +211,7 @@
                 document.getElementById("status").textContent = isInitial ? "Synced on join" : "Resynced after resume";
             }
             hideOverlay();
+            stopUtcRefreshLoop();
             if (!periodicSyncTimer) {
                 periodicSyncTimer = setInterval(periodicSyncAdjust, SYNC_INTERVAL_MS);
             }
@@ -204,6 +219,7 @@
         } else if (event.data === YT.PlayerState.PAUSED) {
             pausedSinceLastPlay = true;
             if (periodicSyncTimer) { clearInterval(periodicSyncTimer); periodicSyncTimer = null; }
+            startUtcRefreshLoop();
         } else if (event.data === YT.PlayerState.UNSTARTED) {
             // Some browsers report UNSTARTED if autoplay is blocked
             showOverlay();
@@ -243,7 +259,12 @@
     // UTC link-based sync and countdown removed for minimal setup
 
     // Stateless, UTC-based target and periodic drift correction
-    function effectiveUtcMs() { return nowUtcMs(); }
+    function effectiveUtcMs() {
+        if (phaseAnchored) {
+            return phaseBaseUtcMs + (performance.now() - phaseBasePerfMs);
+        }
+        return nowUtcMs();
+    }
     function computeUtcTargetPositionSec() {
         const dur = Number(periodSecParam || videoDurationSec) || 0;
         if (dur <= 0) return 0;
@@ -258,6 +279,10 @@
         const resumeAtUtcMs = nowUtcMs() + 600;
         const resumePos = ((resumeAtUtcMs - anchorMs) / 1000) % dur;
         try { player.seekTo(resumePos, true); } catch {}
+        // Lock phase to local perf clock at the planned resume moment
+        phaseBaseUtcMs = resumeAtUtcMs;
+        phaseBasePerfMs = performance.now();
+        phaseAnchored = true;
         // coarse wait then fine spin
         const coarseDelay = Math.max(0, resumeAtUtcMs - nowUtcMs() - 40);
         await new Promise(r => setTimeout(r, coarseDelay));
