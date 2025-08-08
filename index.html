@@ -141,13 +141,14 @@
     let hasInitialSynced = false;
     let pausedSinceLastPlay = false;
     let periodicSyncTimer = null;
-    const SYNC_INTERVAL_MS = 500;
-    const SMOOTH_DRIFT_MIN_SEC = 0.08; // use rate nudge above this
-    const DRIFT_THRESHOLD_SEC = 0.25; // seek only if above this AND not smoothable
-    const MAJOR_DRIFT_SEC = 0.6; // always correct immediately via seek
-    const CORRECTION_COOLDOWN_MS = 2500;
+    const SYNC_INTERVAL_MS = 200;
+    const PAUSE_MIN_SEC = 0.01;      // use pause/resume above 10ms when ahead
+    const DRIFT_THRESHOLD_SEC = 0.25; // seek if beyond this and not using pause
+    const MAJOR_DRIFT_SEC = 0.7;      // always correct immediately via seek
+    const CORRECTION_COOLDOWN_MS = 1200;
     let lastCorrectionAt = 0;
-    let rateCorrectionTimer = null;
+    let pausePending = false;
+    let pauseResumeRaf = 0;
     async function onPlayerStateChange(event) {
         if (event.data === YT.PlayerState.PLAYING) {
             const isInitial = !hasInitialSynced;
@@ -224,39 +225,39 @@
             return;
         }
 
-        // Smooth corrections using temporary playbackRate nudge
-        if (!recentlyCorrected && absDrift >= SMOOTH_DRIFT_MIN_SEC && !rateCorrectionTimer) {
-            applyRateNudge(drift);
+        // If ahead (current > target), pause until target catches up to current
+        if (!recentlyCorrected && drift < -PAUSE_MIN_SEC && !pausePending) {
+            pauseUntilCatchUp(-drift);
             lastCorrectionAt = nowTs;
+            return;
+        }
+        // If behind a bit, do a tiny forward seek to the target
+        if (!recentlyCorrected && drift > PAUSE_MIN_SEC) {
+            try { player.seekTo(target, true); } catch (e) {}
+            lastCorrectionAt = nowTs;
+            document.getElementById('status').textContent = `Corrected drift (${absDrift.toFixed(3)}s)`;
+            return;
         }
     }
-    function applyRateNudge(driftSec) {
-        try {
-            if (!player || !player.getAvailablePlaybackRates || !player.setPlaybackRate) return;
-            const rates = player.getAvailablePlaybackRates();
-            if (!Array.isArray(rates) || rates.length === 0) return;
-            const faster = rates.filter(r => r > 1).sort((a,b)=>a-b)[0] ?? 1.25;
-            const slower = rates.filter(r => r < 1).sort((a,b)=>b-a)[0] ?? 0.75;
-            const wantFaster = driftSec > 0; // we are behind; need to catch up
-            const targetRate = wantFaster ? faster : slower;
-            if (!targetRate || targetRate === 1) {
-                // Fallback: micro seek if only 1x available
-                const micro = Math.sign(driftSec) * Math.max(0.06, Math.min(0.18, Math.abs(driftSec) * 0.9));
-                const cur = player.getCurrentTime ? player.getCurrentTime() : 0;
-                try { player.seekTo(cur + micro, true); } catch (e) {}
-                return;
-            }
-            const delta = Math.abs(targetRate - 1);
-            // Time to apply to correct a fraction (avoid overshoot)
-            const correctionPortion = 0.85;
-            const neededMs = Math.min(1200, Math.max(250, (Math.abs(driftSec) / delta) * 1000 * correctionPortion));
-            player.setPlaybackRate(targetRate);
-            if (rateCorrectionTimer) clearTimeout(rateCorrectionTimer);
-            rateCorrectionTimer = setTimeout(() => {
-                try { player.setPlaybackRate(1.0); } catch (e) {}
-                rateCorrectionTimer = null;
-            }, neededMs);
-        } catch (e) {}
+    function pauseUntilCatchUp(waitSec) {
+        pausePending = true;
+        try { player.pauseVideo(); } catch (e) {}
+        const resumeAtUtcMs = nowUtcMs() + waitSec * 1000;
+        // Coarse timer then fine rAF spin to hit within ~10-20ms
+        const coarseDelay = Math.max(0, waitSec * 1000 - 40);
+        setTimeout(() => {
+            const step = () => {
+                if (nowUtcMs() >= resumeAtUtcMs - 5) {
+                    try { player.playVideo(); } catch (e) {}
+                    pausePending = false;
+                    if (pauseResumeRaf) cancelAnimationFrame(pauseResumeRaf);
+                    pauseResumeRaf = 0;
+                } else {
+                    pauseResumeRaf = requestAnimationFrame(step);
+                }
+            };
+            pauseResumeRaf = requestAnimationFrame(step);
+        }, coarseDelay);
     }
     function periodicSyncAdjust() { syncToTarget(false); }
 
