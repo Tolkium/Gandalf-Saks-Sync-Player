@@ -181,6 +181,11 @@
     let lastDriftSec = null;
     let lastDriftTsMs = null;
     let skewSecPerSec = 0; // estimated drift slope (seconds drift per second)
+    // Tight lock window for sub-10ms convergence
+    let tightLockUntil = 0;
+    let tightLockRaf = 0;
+    const TIGHT_AHEAD_MIN_SEC = 0.005; // 5ms
+    const TIGHT_BEHIND_MIN_SEC = 0.005; // 5ms
     async function onPlayerStateChange(event) {
         if (event.data === YT.PlayerState.PLAYING) {
             const isInitial = !hasInitialSynced;
@@ -194,6 +199,7 @@
             if (!periodicSyncTimer) {
                 periodicSyncTimer = setInterval(periodicSyncAdjust, SYNC_INTERVAL_MS);
             }
+            startTightLockWindow(7000);
         } else if (event.data === YT.PlayerState.PAUSED) {
             pausedSinceLastPlay = true;
             if (periodicSyncTimer) { clearInterval(periodicSyncTimer); periodicSyncTimer = null; }
@@ -227,7 +233,7 @@
     document.getElementById('startPlayback').addEventListener('click', async () => {
         hideOverlay();
         if (mode === 'yt') {
-            try { await schedulePreciseStart(); } catch { try { player.playVideo(); } catch (e) {} }
+            try { await schedulePreciseStart(); startTightLockWindow(7000); } catch { try { player.playVideo(); } catch (e) {} }
         } else {
             try { video.play(); } catch {}
         }
@@ -325,6 +331,36 @@
         }, coarseDelay);
     }
     function periodicSyncAdjust() { syncToTarget(false); }
+
+    function startTightLockWindow(durationMs) {
+        tightLockUntil = performance.now() + Math.max(1000, durationMs || 5000);
+        if (tightLockRaf) cancelAnimationFrame(tightLockRaf);
+        const step = () => {
+            if (performance.now() > tightLockUntil) { tightLockRaf = 0; return; }
+            // Run a tighter correction loop
+            try {
+                const dur = Number(periodSecParam || videoDurationSec) || 0;
+                if (dur > 0) {
+                    const target = computeUtcTargetPositionSec();
+                    const current = player.getCurrentTime ? player.getCurrentTime() : 0;
+                    const drift = target - current;
+                    const absDrift = Math.abs(drift);
+                    if (absDrift <= 0.01) { // within 10ms => stop early
+                        tightLockRaf = 0; return;
+                    }
+                    if (drift < -TIGHT_AHEAD_MIN_SEC && !pausePending) {
+                        pauseUntilCatchUp(-drift);
+                        lastCorrectionAt = performance.now();
+                    } else if (drift > TIGHT_BEHIND_MIN_SEC) {
+                        try { player.seekTo(target, true); } catch (e) {}
+                        lastCorrectionAt = performance.now();
+                    }
+                }
+            } catch {}
+            tightLockRaf = requestAnimationFrame(step);
+        };
+        tightLockRaf = requestAnimationFrame(step);
+    }
 
     // No shared state writes; synchronization is derived from UTC
 
