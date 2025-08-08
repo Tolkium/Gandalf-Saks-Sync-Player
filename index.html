@@ -71,6 +71,12 @@
         if (ps && Number.isFinite(Number(ps))) return Number(ps);
         return null;
     })();
+    // Optional per-device static calibration (to counter audio pipeline latency)
+    const localOffsetMs = (() => {
+        const o = urlParams.get('offsetMs');
+        const n = Number(o);
+        return Number.isFinite(n) ? n : 0;
+    })();
     // Stateless UTC-based sync (no backend, no CORS):
     // All clients compute the same position from a shared UTC clock.
     function nowMs() { return Date.now(); }
@@ -141,6 +147,8 @@
     let phaseBaseUtcMs = 0;
     let phaseBasePerfMs = 0;
     let phaseAnchored = false;
+    // Learned local bias to cancel steady residual offset
+    let localBiasMs = 0; // slowly learned; bounded
     function onYouTubeIframeAPIReady() {
         if (mode !== 'yt') return; // ignore if using native
         player = new YT.Player('player', {
@@ -268,7 +276,8 @@
     function computeUtcTargetPositionSec() {
         const dur = Number(periodSecParam || videoDurationSec) || 0;
         if (dur <= 0) return 0;
-        const pos = ((effectiveUtcMs() - anchorMs) / 1000) % dur;
+        const tMs = (effectiveUtcMs() - anchorMs - localOffsetMs - localBiasMs);
+        const pos = (tMs / 1000) % dur;
         return Math.max(0, Math.min(dur - 0.2, pos));
     }
     async function schedulePreciseStart() {
@@ -312,6 +321,12 @@
         lastDriftSec = drift;
         lastDriftTsMs = nowTs;
         const recentlyCorrected = (nowTs - lastCorrectionAt) < CORRECTION_COOLDOWN_MS;
+
+        // Learn steady-state bias (slow EMA) when within reasonable band
+        if (absDrift < 0.25) {
+            const targetBias = drift * 1000; // ms
+            localBiasMs = Math.max(-200, Math.min(200, 0.98 * localBiasMs + 0.02 * targetBias));
+        }
 
         // Major corrections: single seek
         if (force || absDrift >= MAJOR_DRIFT_SEC || (!recentlyCorrected && absDrift >= DRIFT_THRESHOLD_SEC)) {
