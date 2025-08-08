@@ -52,41 +52,33 @@
     </div>
 
 <script>
-    const urlParams = new URLSearchParams(location.search);
-    // Free sync config via GetPantry (no signup, free). Override via URL: ?pantry=...&room=...
-    const DEFAULT_PANTRY_ID = 'a7183995-e0b0-46b1-bcf0-c2119c005931';
-    const DEFAULT_ROOM_ID = 'default-room';
-    let pantryId = urlParams.get('pantry') || DEFAULT_PANTRY_ID;
-    let roomId = urlParams.get('room') || DEFAULT_ROOM_ID;
-
+    // Stateless UTC-based sync (no backend, no CORS):
+    // All clients compute the same position from a shared UTC clock.
     function nowMs() { return Date.now(); }
-    let serverOffsetMs = 0; // serverTime ~= nowMs() + serverOffsetMs
-    async function refreshServerTimeOffset(sampleCount = 5) {
+    let utcOffsetMs = 0; // world UTC ~= nowMs() + utcOffsetMs
+    async function refreshUtcOffset(sampleCount = 3) {
         const offsets = [];
         for (let i = 0; i < sampleCount; i++) {
             try {
                 const t0 = performance.now();
-                // Hit pantry endpoint that should exist and return Date header
-                const url = `https://getpantry.cloud/apiv1/pantry/${encodeURIComponent(pantryId)}`;
-                const res = await fetch(url, { method: 'GET', cache: 'no-store' });
+                // CORS-friendly time API
+                const res = await fetch('https://worldtimeapi.org/api/timezone/Etc/UTC', { cache: 'no-store' });
                 const t1 = performance.now();
-                const dateHeader = res.headers.get('Date');
-                if (!dateHeader) continue;
-                const serverDateMs = Date.parse(dateHeader);
-                if (!isFinite(serverDateMs)) continue;
+                if (!res.ok) continue;
+                const data = await res.json();
+                // unixtime is in seconds
+                const serverUtcMs = (data.unixtime || Math.floor(Date.parse(data.utc_datetime) / 1000)) * 1000;
                 const rtt = t1 - t0;
-                const estimatedServerNow = serverDateMs + rtt / 2;
-                const offset = estimatedServerNow - nowMs();
-                offsets.push(offset);
+                const estimatedServerNow = serverUtcMs + rtt / 2;
+                offsets.push(estimatedServerNow - nowMs());
             } catch {}
         }
         if (offsets.length > 0) {
             offsets.sort((a, b) => a - b);
-            const median = offsets[Math.floor(offsets.length / 2)];
-            serverOffsetMs = median;
+            utcOffsetMs = offsets[Math.floor(offsets.length / 2)];
         }
     }
-    function nowServerMs() { return nowMs() + serverOffsetMs; }
+    function nowUtcMs() { return nowMs() + utcOffsetMs; }
 
     let player;
     let videoDurationSec = 0;
@@ -121,7 +113,8 @@
         (async () => {
             document.getElementById("status").textContent = "Ready";
             try { videoDurationSec = player.getDuration() || 0; } catch (e) {}
-            await syncFromRemoteOnce();
+            try { await refreshUtcOffset(1); } catch (e) {}
+            try { syncToTarget(true); } catch (e) {}
             attemptAutoplay();
             readyForWrites = true;
         })();
@@ -134,26 +127,17 @@
         if (event.data === YT.PlayerState.PLAYING) {
             const isInitial = !hasInitialSynced;
             if (isInitial || pausedSinceLastPlay) {
-                await syncFromRemoteOnce();
+                syncToTarget(true);
                 hasInitialSynced = true;
                 pausedSinceLastPlay = false;
                 document.getElementById("status").textContent = isInitial ? "Synced on join" : "Resynced after resume";
             }
             hideOverlay();
-            // Start write ticker while playing
-            if (!writeTicker && pantryId && roomId && readyForWrites) {
-                writeTicker = setInterval(writeNowStateThrottled, 5000);
-            }
             if (!periodicSyncTimer) {
                 periodicSyncTimer = setInterval(periodicSyncAdjust, 2000);
             }
         } else if (event.data === YT.PlayerState.PAUSED) {
             pausedSinceLastPlay = true;
-            // Write a final paused state snapshot
-            if (pantryId && roomId && readyForWrites) {
-                writeNowStateThrottled(true);
-            }
-            if (writeTicker) { clearInterval(writeTicker); writeTicker = null; }
             if (periodicSyncTimer) { clearInterval(periodicSyncTimer); periodicSyncTimer = null; }
         } else if (event.data === YT.PlayerState.UNSTARTED) {
             // Some browsers report UNSTARTED if autoplay is blocked
@@ -161,11 +145,9 @@
         }
     }
 
-    // Auto-connect with default/URL room; perform initial server time sync and state sync
+    // Initial world time sync
     (async () => {
-        await refreshServerTimeOffset(5);
-        await syncFromRemoteOnce();
-        document.getElementById('status').textContent = pantryId && roomId ? `Connected to room ${roomId}` : 'Disconnected from remote';
+        await refreshUtcOffset(3);
     })();
 
     // Autoplay helpers
@@ -192,92 +174,26 @@
 
     // UTC link-based sync and countdown removed for minimal setup
 
-    // ---------- Free API (GetPantry) state sync ----------
-    function pantryBasketUrl() {
-        if (!pantryId || !roomId) return null;
-        return `https://getpantry.cloud/apiv1/pantry/${encodeURIComponent(pantryId)}/basket/${encodeURIComponent(roomId)}`;
+    // Stateless, UTC-based target and periodic drift correction
+    function computeUtcTargetPositionSec() {
+        const dur = Number(videoDurationSec) || 0;
+        if (dur <= 0) return 0;
+        const pos = (nowUtcMs() / 1000) % dur;
+        return Math.max(0, Math.min(dur - 0.2, pos));
     }
-
-    async function getSharedState() {
-        const url = pantryBasketUrl();
-        if (!url) return null;
-        try {
-            const res = await fetch(url, { method: 'GET', cache: 'no-store' });
-            if (!res.ok) return null;
-            return await res.json();
-        } catch {
-            return null;
-        }
-    }
-
-    async function setSharedState(state) {
-        const url = pantryBasketUrl();
-        if (!url) return false;
-        try {
-            const res = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state) });
-            return res.ok;
-        } catch {
-            return false;
-        }
-    }
-
-    function computeDerivedPosition(remote) {
-        if (!remote) return null;
-        const base = Number(remote.positionSec) || 0;
-        const updatedAt = Number(remote.updatedAtServerMs || remote.updatedAtMs) || 0;
-        const wasPlaying = !!remote.isPlaying;
-        let derived = base;
-        if (wasPlaying && updatedAt > 0) {
-            const deltaSec = Math.max(0, (nowServerMs() - updatedAt) / 1000);
-            derived = base + deltaSec;
-        }
-        if (videoDurationSec > 0) {
-            derived = Math.min(derived, videoDurationSec - 0.25);
-        }
-        return derived;
-    }
-
-    async function syncFromRemoteOnce() {
-        const remote = await getSharedState();
-        if (!remote) return;
-        const target = computeDerivedPosition(remote);
-        if (target == null) return;
-        try { player.seekTo(target, true); } catch (e) {}
-    }
-
-    async function periodicSyncAdjust() {
-        const remote = await getSharedState();
-        if (!remote) return;
-        const target = computeDerivedPosition(remote);
-        if (target == null) return;
+    function syncToTarget(force = false) {
+        const target = computeUtcTargetPositionSec();
         let current = 0;
         try { current = player.getCurrentTime ? player.getCurrentTime() : 0; } catch (e) { current = 0; }
         const drift = Math.abs(current - target);
-        if (drift > 0.25) {
+        if (force || drift > 0.25) {
             try { player.seekTo(target, true); } catch (e) {}
-            document.getElementById('status').textContent = `Corrected drift (${drift.toFixed(2)}s)`;
+            if (!force) document.getElementById('status').textContent = `Corrected drift (${drift.toFixed(2)}s)`;
         }
     }
+    function periodicSyncAdjust() { syncToTarget(false); }
 
-    let lastWriteMs = 0;
-    async function writeNowStateThrottled(force = false) {
-        if (!readyForWrites || !pantryId || !roomId) return;
-        const now = Date.now();
-        if (!force && now - lastWriteMs < 2000) return;
-        lastWriteMs = now;
-        try {
-            const isPlaying = player.getPlayerState && player.getPlayerState() === YT.PlayerState.PLAYING;
-            const positionSec = player.getCurrentTime ? player.getCurrentTime() : 0;
-            const state = {
-                videoId: 'syZgEDz_R28',
-                positionSec,
-                isPlaying,
-                updatedAtMs: nowMs(),
-                updatedAtServerMs: nowServerMs()
-            };
-            await setSharedState(state);
-        } catch {}
-    }
+    // No shared state writes; synchronization is derived from UTC
 
     let tag = document.createElement('script');
     tag.src = "https://www.youtube.com/iframe_api";
