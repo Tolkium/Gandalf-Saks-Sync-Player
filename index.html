@@ -27,6 +27,20 @@
         text-align: left;
         display: inline-block;
     }
+    #autoplayOverlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.7);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+    }
+    #autoplayOverlay button {
+        font-size: 20px;
+        padding: 12px 24px;
+        cursor: pointer;
+    }
 </style>
 </head>
 <body>
@@ -44,6 +58,10 @@
 <div id="status">Loading...</div>
 
 <div id="debug"></div>
+
+<div id="autoplayOverlay">
+    <button id="startPlayback">Tap to start</button>
+    </div>
 
 <script>
     const GLOBAL_START_TIME = new Date("2025-01-01T00:00:00Z").getTime();
@@ -100,22 +118,37 @@
     function onPlayerReady() {
         // Mute to satisfy autoplay policies across devices/browsers
         try { player.mute(); } catch (e) {}
-        document.getElementById("status").textContent = "Ready";
+        // Ensure iframe allows autoplay
+        try {
+            player.getIframe().setAttribute('allow', 'autoplay; encrypted-media; picture-in-picture');
+        } catch (e) {}
+        attemptAutoplay();
+        document.getElementById("status").textContent = "Ready (attempting autoplay)";
     }
 
     let hasInitialSynced = false;
+    let pausedSinceLastPlay = false;
     async function onPlayerStateChange(event) {
-        if (event.data === YT.PlayerState.PLAYING && !hasInitialSynced) {
-            // One-time server time refresh to align join time
-            await refreshServerTimeOffset();
-            const ideal = getIdealPosition();
-            try { player.seekTo(ideal, true); } catch (e) {}
-            hasInitialSynced = true;
-            document.getElementById("status").textContent = "Synced on join";
-            document.getElementById("debug").innerHTML =
-                `<strong>Loop length:</strong> ${loopLengthMs} ms<br>` +
-                `<strong>Ideal position:</strong> ${ideal.toFixed(3)}s<br>` +
-                `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms`;
+        if (event.data === YT.PlayerState.PLAYING) {
+            const isInitial = !hasInitialSynced;
+            if (isInitial || pausedSinceLastPlay) {
+                await refreshServerTimeOffset();
+                const ideal = getIdealPosition();
+                try { player.seekTo(ideal, true); } catch (e) {}
+                hasInitialSynced = true;
+                pausedSinceLastPlay = false;
+                document.getElementById("status").textContent = isInitial ? "Synced on join" : "Resynced after resume";
+                document.getElementById("debug").innerHTML =
+                    `<strong>Loop length:</strong> ${loopLengthMs} ms<br>` +
+                    `<strong>Ideal position:</strong> ${ideal.toFixed(3)}s<br>` +
+                    `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms`;
+            }
+            hideOverlay();
+        } else if (event.data === YT.PlayerState.PAUSED) {
+            pausedSinceLastPlay = true;
+        } else if (event.data === YT.PlayerState.UNSTARTED) {
+            // Some browsers report UNSTARTED if autoplay is blocked
+            showOverlay();
         }
     }
 
@@ -138,9 +171,30 @@
 
     document.getElementById("loopLength").value = loopLengthMs;
 
-    // Kick off server time sync and keep it fresh
+    // Kick off server time sync once; periodic refresh optional but harmless
     refreshServerTimeOffset();
-    setInterval(refreshServerTimeOffset, 60 * 1000);
+
+    // Autoplay helpers
+    function isPlaying() {
+        try { return player && player.getPlayerState && player.getPlayerState() === YT.PlayerState.PLAYING; } catch (e) { return false; }
+    }
+    function attemptAutoplay() {
+        try { player.playVideo(); } catch (e) {}
+        // If not playing shortly, show overlay for user gesture
+        setTimeout(() => { if (!isPlaying()) showOverlay(); }, 1200);
+    }
+    function showOverlay() {
+        const ov = document.getElementById('autoplayOverlay');
+        if (ov) ov.style.display = 'flex';
+    }
+    function hideOverlay() {
+        const ov = document.getElementById('autoplayOverlay');
+        if (ov) ov.style.display = 'none';
+    }
+    document.getElementById('startPlayback').addEventListener('click', () => {
+        hideOverlay();
+        try { player.playVideo(); } catch (e) {}
+    });
 
     let tag = document.createElement('script');
     tag.src = "https://www.youtube.com/iframe_api";
