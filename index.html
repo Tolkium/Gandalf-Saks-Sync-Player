@@ -43,6 +43,7 @@
 
 <div id="status">Loading...</div>
 
+
 <div id="autoplayOverlay">
     <div id="overlayContent">
         <div id="overlayText">Tap to start</div>
@@ -59,6 +60,33 @@
     let roomId = urlParams.get('room') || DEFAULT_ROOM_ID;
 
     function nowMs() { return Date.now(); }
+    let serverOffsetMs = 0; // serverTime ~= nowMs() + serverOffsetMs
+    async function refreshServerTimeOffset(sampleCount = 5) {
+        const offsets = [];
+        for (let i = 0; i < sampleCount; i++) {
+            try {
+                const t0 = performance.now();
+                // Hit pantry endpoint that should exist and return Date header
+                const url = `https://getpantry.cloud/apiv1/pantry/${encodeURIComponent(pantryId)}`;
+                const res = await fetch(url, { method: 'GET', cache: 'no-store' });
+                const t1 = performance.now();
+                const dateHeader = res.headers.get('Date');
+                if (!dateHeader) continue;
+                const serverDateMs = Date.parse(dateHeader);
+                if (!isFinite(serverDateMs)) continue;
+                const rtt = t1 - t0;
+                const estimatedServerNow = serverDateMs + rtt / 2;
+                const offset = estimatedServerNow - nowMs();
+                offsets.push(offset);
+            } catch {}
+        }
+        if (offsets.length > 0) {
+            offsets.sort((a, b) => a - b);
+            const median = offsets[Math.floor(offsets.length / 2)];
+            serverOffsetMs = median;
+        }
+    }
+    function nowServerMs() { return nowMs() + serverOffsetMs; }
 
     let player;
     let videoDurationSec = 0;
@@ -101,6 +129,7 @@
 
     let hasInitialSynced = false;
     let pausedSinceLastPlay = false;
+    let periodicSyncTimer = null;
     async function onPlayerStateChange(event) {
         if (event.data === YT.PlayerState.PLAYING) {
             const isInitial = !hasInitialSynced;
@@ -115,6 +144,9 @@
             if (!writeTicker && pantryId && roomId && readyForWrites) {
                 writeTicker = setInterval(writeNowStateThrottled, 5000);
             }
+            if (!periodicSyncTimer) {
+                periodicSyncTimer = setInterval(periodicSyncAdjust, 2000);
+            }
         } else if (event.data === YT.PlayerState.PAUSED) {
             pausedSinceLastPlay = true;
             // Write a final paused state snapshot
@@ -122,53 +154,19 @@
                 writeNowStateThrottled(true);
             }
             if (writeTicker) { clearInterval(writeTicker); writeTicker = null; }
+            if (periodicSyncTimer) { clearInterval(periodicSyncTimer); periodicSyncTimer = null; }
         } else if (event.data === YT.PlayerState.UNSTARTED) {
             // Some browsers report UNSTARTED if autoplay is blocked
             showOverlay();
         }
     }
 
-    function getIdealPosition() {
-        const now = nowMs();
-        const elapsed = (now - SESSION_START_TIME_MS) % loopLengthMs;
-        return elapsed / 1000;
-    }
-
-    // No periodic drift correction. New visitors sync once on start; existing
-    // viewers are not resynchronized.
-
-    document.getElementById("saveSettings").addEventListener("click", () => {
-        const val = parseInt(document.getElementById("loopLength").value);
-        if (!isNaN(val) && val > 100) {
-            loopLengthMs = val;
-            localStorage.setItem("loopLengthMs", loopLengthMs);
-        }
-    });
-
-    document.getElementById("loopLength").value = loopLengthMs;
-
-    // Initialize free sync inputs
-    const pantryEl = document.getElementById('pantryId');
-    const roomEl = document.getElementById('roomId');
-    pantryEl.value = pantryId;
-    roomEl.value = roomId;
-    document.getElementById('connectRoom').addEventListener('click', () => {
-        pantryId = pantryEl.value.trim();
-        roomId = roomEl.value.trim();
-        localStorage.setItem('pantryId', pantryId);
-        localStorage.setItem('roomId', roomId);
+    // Auto-connect with default/URL room; perform initial server time sync and state sync
+    (async () => {
+        await refreshServerTimeOffset(5);
+        await syncFromRemoteOnce();
         document.getElementById('status').textContent = pantryId && roomId ? `Connected to room ${roomId}` : 'Disconnected from remote';
-        // Pull current shared state immediately on connect
-        if (pantryId && roomId) {
-            (async () => {
-                await refreshServerTimeOffset(3);
-                await syncFromRemoteOnce();
-            })();
-        }
-    });
-
-    // Kick off server time sync once; periodic refresh optional but harmless
-    refreshServerTimeOffset(5);
+    })();
 
     // Autoplay helpers
     function isPlaying() {
@@ -192,7 +190,7 @@
         try { player.playVideo(); } catch (e) {}
     });
 
-    // Removed UTC link-based sync and countdown for minimal setup
+    // UTC link-based sync and countdown removed for minimal setup
 
     // ---------- Free API (GetPantry) state sync ----------
     function pantryBasketUrl() {
@@ -226,11 +224,11 @@
     function computeDerivedPosition(remote) {
         if (!remote) return null;
         const base = Number(remote.positionSec) || 0;
-        const updatedAt = Number(remote.updatedAtMs) || 0;
+        const updatedAt = Number(remote.updatedAtServerMs || remote.updatedAtMs) || 0;
         const wasPlaying = !!remote.isPlaying;
         let derived = base;
         if (wasPlaying && updatedAt > 0) {
-            const deltaSec = Math.max(0, (nowMs() - updatedAt) / 1000);
+            const deltaSec = Math.max(0, (nowServerMs() - updatedAt) / 1000);
             derived = base + deltaSec;
         }
         if (videoDurationSec > 0) {
@@ -247,6 +245,20 @@
         try { player.seekTo(target, true); } catch (e) {}
     }
 
+    async function periodicSyncAdjust() {
+        const remote = await getSharedState();
+        if (!remote) return;
+        const target = computeDerivedPosition(remote);
+        if (target == null) return;
+        let current = 0;
+        try { current = player.getCurrentTime ? player.getCurrentTime() : 0; } catch (e) { current = 0; }
+        const drift = Math.abs(current - target);
+        if (drift > 0.25) {
+            try { player.seekTo(target, true); } catch (e) {}
+            document.getElementById('status').textContent = `Corrected drift (${drift.toFixed(2)}s)`;
+        }
+    }
+
     let lastWriteMs = 0;
     async function writeNowStateThrottled(force = false) {
         if (!readyForWrites || !pantryId || !roomId) return;
@@ -260,7 +272,8 @@
                 videoId: 'syZgEDz_R28',
                 positionSec,
                 isPlaying,
-                updatedAtMs: nowMs()
+                updatedAtMs: nowMs(),
+                updatedAtServerMs: nowServerMs()
             };
             await setSharedState(state);
         } catch {}
