@@ -100,14 +100,22 @@
     function onPlayerReady() {
         // Mute to satisfy autoplay policies across devices/browsers
         try { player.mute(); } catch (e) {}
-        // Initial syncs run more frequently to converge quickly
-        setInterval(syncLoop, 250);
+        document.getElementById("status").textContent = "Ready";
     }
 
-    function onPlayerStateChange(event) {
-        if (event.data === YT.PlayerState.PLAYING) {
-            // Snap immediately when playback starts/resumes
-            syncLoop(true);
+    let hasInitialSynced = false;
+    async function onPlayerStateChange(event) {
+        if (event.data === YT.PlayerState.PLAYING && !hasInitialSynced) {
+            // One-time server time refresh to align join time
+            await refreshServerTimeOffset();
+            const ideal = getIdealPosition();
+            try { player.seekTo(ideal, true); } catch (e) {}
+            hasInitialSynced = true;
+            document.getElementById("status").textContent = "Synced on join";
+            document.getElementById("debug").innerHTML =
+                `<strong>Loop length:</strong> ${loopLengthMs} ms<br>` +
+                `<strong>Ideal position:</strong> ${ideal.toFixed(3)}s<br>` +
+                `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms`;
         }
     }
 
@@ -117,28 +125,8 @@
         return elapsed / 1000;
     }
 
-    function syncLoop(forceSnap = false) {
-        if (!player || typeof player.getCurrentTime !== "function") return;
-
-        const ideal = getIdealPosition();
-        const current = player.getCurrentTime();
-        const drift = current - ideal;
-
-        // Snap if drift is noticeable or if explicitly forced
-        if (forceSnap || Math.abs(drift) > 0.2) {
-            player.seekTo(ideal, true);
-            document.getElementById("status").textContent = "Resynced";
-        } else {
-            document.getElementById("status").textContent = "In Sync";
-        }
-
-        document.getElementById("debug").innerHTML =
-            `<strong>Loop length:</strong> ${loopLengthMs} ms<br>` +
-            `<strong>Ideal position:</strong> ${ideal.toFixed(3)}s<br>` +
-            `<strong>Video time:</strong> ${current.toFixed(3)}s<br>` +
-            `<strong>Drift:</strong> ${drift.toFixed(3)}s<br>` +
-            `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms`;
-    }
+    // No periodic drift correction. New visitors sync once on start; existing
+    // viewers are not resynchronized.
 
     document.getElementById("saveSettings").addEventListener("click", () => {
         const val = parseInt(document.getElementById("loopLength").value);
