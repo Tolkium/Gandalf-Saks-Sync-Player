@@ -33,11 +33,11 @@
 
 <h1>Gandalf Saks Sync Player</h1>
 
-<div>
-    Loop length (ms): 
-    <input type="number" id="loopLength" value="6000" min="100" step="100">
-    <button id="saveSettings">Save</button>
-</div>
+    <div>
+        Loop length (ms): 
+        <input type="number" id="loopLength" value="7500" min="100" step="50">
+        <button id="saveSettings">Save</button>
+    </div>
 
 <div id="player"></div>
 
@@ -47,7 +47,35 @@
 
 <script>
     const GLOBAL_START_TIME = new Date("2025-01-01T00:00:00Z").getTime();
-    let loopLengthMs = localStorage.getItem("loopLengthMs") || 6000;
+    let loopLengthMs = Number(localStorage.getItem("loopLengthMs")) || 7500;
+
+    // Maintain an offset between server clock and client clock so all devices
+    // use a common time reference regardless of local clock skew.
+    let serverTimeOffsetMs = 0; // server_now_ms - client_now_ms
+
+    async function refreshServerTimeOffset() {
+        try {
+            const t0 = Date.now();
+            // Use HEAD to get the Date header; bust caches to avoid stale dates
+            const res = await fetch(location.href + (location.href.includes('?') ? '&' : '?') + 'nocache=' + Math.random(), {
+                method: 'HEAD',
+                cache: 'no-store'
+            });
+            const t2 = Date.now();
+            const dateHeader = res.headers.get('Date');
+            if (dateHeader) {
+                const serverNow = new Date(dateHeader).getTime();
+                const clientMid = (t0 + t2) / 2;
+                serverTimeOffsetMs = serverNow - clientMid;
+            }
+        } catch (e) {
+            // Leave offset unchanged on failure
+        }
+    }
+
+    function nowMs() {
+        return Date.now() + serverTimeOffsetMs;
+    }
 
     let player;
     function onYouTubeIframeAPIReady() {
@@ -59,32 +87,45 @@
                 modestbranding: 1,
                 loop: 1,
                 playlist: 'xL8-y3oX1R0',
-                rel: 0
+                rel: 0,
+                playsinline: 1
             },
             events: {
-                'onReady': onPlayerReady
+                'onReady': onPlayerReady,
+                'onStateChange': onPlayerStateChange
             }
         });
     }
 
     function onPlayerReady() {
-        setInterval(syncLoop, 500);
+        // Mute to satisfy autoplay policies across devices/browsers
+        try { player.mute(); } catch (e) {}
+        // Initial syncs run more frequently to converge quickly
+        setInterval(syncLoop, 250);
+    }
+
+    function onPlayerStateChange(event) {
+        if (event.data === YT.PlayerState.PLAYING) {
+            // Snap immediately when playback starts/resumes
+            syncLoop(true);
+        }
     }
 
     function getIdealPosition() {
-        const now = Date.now();
+        const now = nowMs();
         const elapsed = (now - GLOBAL_START_TIME) % loopLengthMs;
         return elapsed / 1000;
     }
 
-    function syncLoop() {
+    function syncLoop(forceSnap = false) {
         if (!player || typeof player.getCurrentTime !== "function") return;
 
         const ideal = getIdealPosition();
         const current = player.getCurrentTime();
         const drift = current - ideal;
 
-        if (Math.abs(drift) > 0.2) {
+        // Snap if drift is noticeable or if explicitly forced
+        if (forceSnap || Math.abs(drift) > 0.2) {
             player.seekTo(ideal, true);
             document.getElementById("status").textContent = "Resynced";
         } else {
@@ -95,7 +136,8 @@
             `<strong>Loop length:</strong> ${loopLengthMs} ms<br>` +
             `<strong>Ideal position:</strong> ${ideal.toFixed(3)}s<br>` +
             `<strong>Video time:</strong> ${current.toFixed(3)}s<br>` +
-            `<strong>Drift:</strong> ${drift.toFixed(3)}s`;
+            `<strong>Drift:</strong> ${drift.toFixed(3)}s<br>` +
+            `<strong>Server offset:</strong> ${serverTimeOffsetMs.toFixed(0)} ms`;
     }
 
     document.getElementById("saveSettings").addEventListener("click", () => {
@@ -107,6 +149,10 @@
     });
 
     document.getElementById("loopLength").value = loopLengthMs;
+
+    // Kick off server time sync and keep it fresh
+    refreshServerTimeOffset();
+    setInterval(refreshServerTimeOffset, 60 * 1000);
 
     let tag = document.createElement('script');
     tag.src = "https://www.youtube.com/iframe_api";
